@@ -41,7 +41,7 @@ const WiFiCredential wifiList[] = {
 const size_t wifiCount = sizeof(wifiList) / sizeof(wifiList[0]);
 
 // ---------------------------------------------------------------------------
-// 电台列表 (全部为可公开访问的 HTTP MP3 流; ESP32-C3 无 TLS, 不要填 https)
+// 电台列表
 // ---------------------------------------------------------------------------
 struct RadioStation {
   const char *name;
@@ -50,10 +50,9 @@ struct RadioStation {
 };
 
 const RadioStation radioStations[] = {
-  { "Radio Paradise",   "http://stream.radioparadise.com/mp3-128",                 "rp.bmp"         },
+  { "MANGORADIO",       "http://mangoradio.stream.laut.fm/mangoradio",             "mangoradio.bmp" },
   { "BBC",              "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service",  "bbc.bmp"        },
   { "HIT FM",           "http://online.hitfm.ua/HitFM",                            "hitfm.bmp"      },
-  { "MANGORADIO",       "http://mangoradio.stream.laut.fm/mangoradio",             "mangoradio.bmp" },
   { "ZZ959",            "http://lhttp.qtfm.cn/live/5021381/64k.mp3",               "zz959.bmp"      },
   { "Groove Salad",     "http://ice1.somafm.com/groovesalad-128-mp3",              "groove.bmp"     },
   { "Radio Swiss Jazz", "http://stream.srg-ssr.ch/m/rsj/mp3_128",                  "rsj.bmp"        },
@@ -76,15 +75,16 @@ const size_t stationCount = sizeof(radioStations) / sizeof(radioStations[0]);
 #define BTN_DEBOUNCE_MS 30      // 短于此视作抖动, 忽略
 #define BTN_LONG_MS     1200    // 按住超过这么久算长按
 
-// 旋转编码器(鼠标滚轮那种): A/B 两相 + 中间公共脚。
-// 公共脚接 GND, A/B 分别接下面两脚, 同理靠内部上拉。
-#define ENC_A_PIN       4
-#define ENC_B_PIN       6
+// 音量按键: 各接一颗轻触开关, 另一端接 GND, 用芯片内部上拉, 不需要外部电阻。
+// 选 4/6 是因为原来编码器就占这两个脚, 换方案不用挪接线位置。都不是 strapping 脚, 随便按。
+#define VOL_UP_PIN      4
+#define VOL_DOWN_PIN    6
+#define VOL_REPEAT_MS   250    // 按住不放的连发节奏: 第一步立即给, 之后每 250ms 一步
 
 // 音量: ESP8266Audio 的 SetGain() 是个乘法增益, 0.0 ~ 2.0 够用, 再大必削顶。
 #define VOL_MIN         0.0f
 #define VOL_MAX         2.0f
-#define VOL_STEP        0.05f   // 编码器每一格的增减量
+#define VOL_STEP        0.05f   // 一步的增减量(音量键一次按两步 = 0.1)
 
 // ---------------------------------------------------------------------------
 // 播放参数
@@ -120,12 +120,12 @@ const size_t stationCount = sizeof(radioStations) / sizeof(radioStations[0]);
 // 44100Hz 除不尽 -> 实际输出频率和标称值有偏差。偏差意味着"消耗速度 != 实时速度",
 // 环形缓冲会缓慢涨或跌, 直到撑满或饿死。用 [stat] 里的 out= 实测值反推需要多少:
 //   偏差 ppm = (实测 - 标称) / 标称 * 1e6, 取负号填进来。
-// 实测健康期稳定在 44058~44117Hz(±0.04%), 保持 0 即可。
+// 先留 0, 测出来再改。
 #define I2S_RATE_TRIM_PPM  0
 
 #define STAT_INTERVAL_MS 15000  // 播放中每 15s 打一行健康报告
 
-// 【卡顿的根因之一】
+// 【卡顿的根因就在这儿】
 // lwIP 编译时的 TCP 接收窗口只有 5760 字节(见 sdkconfig.h 的 CONFIG_LWIP_TCP_WND_DEFAULT),
 // 而 TCP 的吞吐上限约等于 "窗口 / 往返时延"。Radio Paradise 服务器在美国, 实测 RTT=382ms:
 //     5760 / 0.382 = 15.1 kB/s  <  128kbps 需要的 16.0 kB/s

@@ -340,8 +340,10 @@ static void handleLost() {
 static void serviceControls() {
   Controls::poll();
 
-  int d = Controls::takeEncoderDelta();
-  if (d) nudgeVolume(d);
+  // 音量键不用等安全边界 —— 调音量不碰流, 随时可以直接执行(按住还能连发)。
+  // 主键(切台/静音)才走 handleControlsImpl() 的安全边界。
+  if (Controls::takePending(BTN_VOL_UP)   == BTN_SHORT) nudgeVolume(2);
+  if (Controls::takePending(BTN_VOL_DOWN) == BTN_SHORT) nudgeVolume(-2);
 }
 
 // 取出排队的按键事件并执行。只在状态机的安全边界调用 —— 执行过程中会拆重建整套流。
@@ -504,8 +506,9 @@ void setup() {
             (int)DMA_BUF_COUNT, (int)DMA_WINDOW_MS, (unsigned)ESP.getFreeHeap());
 
   Controls::begin();
-  logStatus("[io  ] button GPIO%d (short press = next, long press = mute)", BTN_PIN);
-  logStatus("[io  ] encoder A=GPIO%d B=GPIO%d (common -> GND)", ENC_A_PIN, ENC_B_PIN);
+  logStatus("[io  ] button GPIO%d (short = next station, long = mute)", BTN_PIN);
+  logStatus("[io  ] vol+ GPIO%d / vol- GPIO%d (tap = %.2f, hold = repeat)",
+            VOL_UP_PIN, VOL_DOWN_PIN, VOL_STEP * 2);
   if (digitalRead(BTN_PIN) == BTN_ACTIVE) {
     logStatus("[io  ] WARN: button already pressed at boot -> ignored until released");
   }

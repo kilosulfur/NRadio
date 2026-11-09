@@ -10,134 +10,138 @@ namespace Controls {
 inline uint32_t IRAM_ATTR nowMs() { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
 
 // ===========================================================================
-// 旋转编码器
-// ===========================================================================
-// 两相方波差 90°, 合起来走格雷码环: 00 -> 01 -> 11 -> 10 -> 00。
-// 把"上次/这次"两状态拼成 4bit 索引查表, 直接得方向与有效性。
-// 好处是抖动造成的非法跳变(如 00 -> 11)查表得 0, 自动被吃掉一大半,
-// 比"在 A 的上升沿看一眼 B"那种土办法稳。
-// 表是标准 Ben Buxton 表: 索引 = (旧 << 2) | 新, 值 +1 表示顺时针。
-static const int8_t kEncTable[16] = {
-   0, -1,  1,  0,
-   1,  0,  0, -1,
-  -1,  0,  0,  1,
-   0,  1, -1,  0,
-};
-
-static volatile int     sEncDelta = 0;
-static volatile uint8_t sEncState = 0;
-
-// 必须用 gpio_get_level() 而不是 digitalRead(): 后者代码在 flash 里,
-// 一旦某时刻 flash cache 被禁用(写 flash/NVS 时就会), IRAM 中断调它直接崩。
-inline uint8_t readAB() {
-  return (uint8_t)(((gpio_get_level((gpio_num_t)ENC_A_PIN) ? 1 : 0) << 1) |
-                    (gpio_get_level((gpio_num_t)ENC_B_PIN) ? 1 : 0));
-}
-
-// A/B 两个脚都挂到这一个回调上, 任何边沿都重读一遍两相状态。
-// 用中断而不是主循环轮询的原因: 播放时 loop() 每转一圈要花 20~100ms 解 MP3 帧,
-// 这个采样率跟不上手拧的速度, 会明显丢格。
-static void IRAM_ATTR onEncoderEdge() {
-  uint8_t cur  = readAB();
-  uint8_t prev = sEncState;
-  sEncState    = cur;
-  int8_t d     = kEncTable[(prev << 2) | cur];
-  if (d) sEncDelta += d;
-}
-
-// ===========================================================================
-// 按键: 同样走中断, 靠脉宽区分短按/长按
+// 按键: 每颗脚挂 CHANGE 中断, 靠脉宽区分短按/长按
 // ===========================================================================
 // 轮询在这儿不够用: 杜邦线碰一下 GND 常常只有十几毫秒, 而 loop() 一圈要几十毫秒,
 // 轮询很可能整个采样窗口都错过这段低电平, 表现为"按了没反应"。
-static volatile bool     sActive  = false;
-static volatile uint32_t sFallMs  = 0;
-static volatile uint32_t sRiseMs  = 0;
-static volatile uint32_t sBtnSeq  = 0;   // 每次电平翻转自增, 主循环靠它判断有没有新事件
+struct BtnState {
+  int      pin;
+  bool     repeat;                 // true: 按住不放会连发 SHORT(音量键用)
+                                   // false: 长按发一次 LONG, 短按发一次 SHORT
 
-static uint32_t sLastSeq   = 0;
-static bool     sLongDone  = false;
-static BtnEvent sPending   = BTN_NONE;
+  volatile bool     active;        // 当前电平处于按下态?
+  volatile uint32_t fallMs;        // 按下时刻
+  volatile uint32_t riseMs;        // 松开时刻
+  volatile uint32_t seq;           // 每次电平翻转自增, 主循环靠它判断有没有新边沿
 
-inline bool pinActive() {
-  const bool hi = (gpio_get_level((gpio_num_t)BTN_PIN) != 0);
-  return (BTN_ACTIVE == LOW) ? !hi : hi;
-}
+  // --- 主循环侧(无并发) ---
+  uint32_t lastSeq;
+  bool     longDone;               // 本次按压已发过 LONG(主键), 开机即按住时也置位以吞掉这次
+  bool     repeated;               // 本次按压已连发过 -> 松手不再补 SHORT
+  uint32_t lastRepeatMs;
+  BtnEvent pending;
+};
 
-static void IRAM_ATTR onBtnEdge() {
-  const bool     act = pinActive();
-  const uint32_t t   = nowMs();
+static BtnState sBtn[BTN_COUNT] = {
+  /* BTN_MAIN      */ { BTN_PIN,     false },
+  /* BTN_VOL_UP    */ { VOL_UP_PIN,  true  },
+  /* BTN_VOL_DOWN  */ { VOL_DOWN_PIN, true },
+};
+
+// 必须用 gpio_get_level() 而不是 digitalRead(): 后者代码在 flash 里,
+// 一旦某时刻 flash cache 被禁用(写 flash/NVS 时就会), IRAM 中断调它直接崩。
+static void IRAM_ATTR btnEdgeISR(uint8_t i) {
+  BtnState &b    = sBtn[i];
+  const bool hi  = (gpio_get_level((gpio_num_t)b.pin) != 0);
+  const bool act = (BTN_ACTIVE == LOW) ? !hi : hi;
+  const uint32_t t = nowMs();
   if (act) {
-    if (!sActive) { sActive = true; sFallMs = t; sBtnSeq++; }
+    if (!b.active) { b.active = true; b.fallMs = t; b.seq++; }
   } else {
-    if (sActive) { sActive = false; sRiseMs = t; sBtnSeq++; }
+    if (b.active) { b.active = false; b.riseMs = t; b.seq++; }
   }
 }
+
+// attachInterrupt 只收 void(*)(), 不能带参, 每颗脚包一层
+static void IRAM_ATTR onMainEdge() { btnEdgeISR(BTN_MAIN); }
+static void IRAM_ATTR onUpEdge()   { btnEdgeISR(BTN_VOL_UP); }
+static void IRAM_ATTR onDownEdge() { btnEdgeISR(BTN_VOL_DOWN); }
 
 // ---------------------------------------------------------------------------
 
 void begin() {
+  for (uint8_t i = 0; i < BTN_COUNT; i++) {
+    BtnState &b = sBtn[i];
 #if BTN_ACTIVE == LOW
-  pinMode(BTN_PIN, INPUT_PULLUP);
+    pinMode(b.pin, INPUT_PULLUP);
 #else
-  pinMode(BTN_PIN, INPUT_PULLDOWN);
+    pinMode(b.pin, INPUT_PULLDOWN);
 #endif
-  pinMode(ENC_A_PIN, INPUT_PULLUP);
-  pinMode(ENC_B_PIN, INPUT_PULLUP);
-  delayMicroseconds(50);
+    delayMicroseconds(50);
+    const bool hi  = (digitalRead(b.pin) != 0);
+    const bool act = (BTN_ACTIVE == LOW) ? !hi : hi;
 
-  // 上电时如果按键已经被按着(或线还短接着 GND), 不能让它立刻算一次按压 ——
-  // 否则开机即跳台/静音。把它记成"这次按压已处理过", 等用户真正松开再按才开始计数。
-  sActive = pinActive();
-  if (sActive) { sFallMs = nowMs(); sLongDone = true; }
-  sBtnSeq = sLastSeq = 0;
+    // 上电时如果按键已经被按着(或线还短接着 GND), 不能让它立刻算一次按压 ——
+    // 否则开机即跳台/静音。把它记成"这次按压已处理过", 等用户真正松开再按才开始计数。
+    b.active   = act;
+    b.fallMs   = act ? nowMs() : 0;
+    b.longDone = act;
+    b.repeated = false;
+    b.seq = b.lastSeq = 0;
+    b.lastRepeatMs = 0;
+    b.pending = BTN_NONE;
+  }
 
-  // 先读出初始状态, 否则第一次中断会拿 0 当旧状态, 白给一格
-  sEncState = readAB();
-
-  attachInterrupt(digitalPinToInterrupt(BTN_PIN),  onBtnEdge,     CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), onEncoderEdge, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), onEncoderEdge, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BTN_PIN),      onMainEdge, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(VOL_UP_PIN),   onUpEdge,   CHANGE);
+  attachInterrupt(digitalPinToInterrupt(VOL_DOWN_PIN), onDownEdge, CHANGE);
 }
 
 void poll() {
-  // 长按: 按住期间到点就报一次
-  if (sActive) {
-    if (!sLongDone && (nowMs() - sFallMs) >= BTN_LONG_MS) {
-      sLongDone = true;
-      sPending  = BTN_LONG;
-    }
-  } else {
-    sLongDone = false;
-  }
+  const uint32_t t = nowMs();
+  for (uint8_t i = 0; i < BTN_COUNT; i++) {
+    BtnState &b = sBtn[i];
 
-  // 释放沿 -> 结算按压时长, 落在 [debounce, long) 区间内才算短按
-  const uint32_t seq = sBtnSeq;
-  if (seq != sLastSeq) {
-    sLastSeq = seq;
-    if (!sActive && sRiseMs) {
-      const uint32_t held = sRiseMs - sFallMs;
-      sRiseMs = 0;
-      if (held >= BTN_DEBOUNCE_MS && held < BTN_LONG_MS) sPending = BTN_SHORT;
+    // 按住期间的事件(长按 / 连发)
+    if (b.active) {
+      const uint32_t held = t - b.fallMs;
+      if (b.repeat) {
+        // 音量键: 过了防抖期立刻给一步, 之后每 VOL_REPEAT_MS 连发一步。
+        // "先给一步再连发"比"等 600ms 才开始动"手感好得多。
+        if (held >= BTN_DEBOUNCE_MS) {
+          if (b.lastRepeatMs == 0) {
+            b.lastRepeatMs = t;
+            b.repeated     = true;
+            b.pending      = BTN_SHORT;
+          } else if ((t - b.lastRepeatMs) >= VOL_REPEAT_MS) {
+            b.lastRepeatMs = t;
+            b.pending      = BTN_SHORT;
+          }
+        }
+      } else if (!b.longDone && held >= BTN_LONG_MS) {
+        b.longDone = true;
+        b.pending  = BTN_LONG;
+      }
+    }
+
+    // 释放沿 -> 结算按压时长
+    const uint32_t seq = b.seq;
+    if (seq != b.lastSeq) {
+      b.lastSeq = seq;
+      if (!b.active && b.riseMs) {
+        const uint32_t held = b.riseMs - b.fallMs;
+        b.riseMs = 0;
+        if (b.repeat) {
+          // 连发过就不再补, 纯快速点按(没到防抖期之外的连发节奏)给一步
+          if (!b.repeated && held >= BTN_DEBOUNCE_MS) b.pending = BTN_SHORT;
+          b.repeated     = false;
+          b.lastRepeatMs = 0;
+        } else {
+          // 落在 [debounce, long) 区间内才算短按
+          if (!b.longDone && held >= BTN_DEBOUNCE_MS && held < BTN_LONG_MS)
+            b.pending = BTN_SHORT;
+        }
+      }
     }
   }
 }
 
-bool hasPending() { return sPending != BTN_NONE; }
+bool hasPending(BtnId id) { return sBtn[id].pending != BTN_NONE; }
 
-BtnEvent takePending() {
-  BtnEvent e = sPending;
-  sPending   = BTN_NONE;
+BtnEvent takePending(BtnId id) {
+  BtnEvent e   = sBtn[id].pending;
+  sBtn[id].pending = BTN_NONE;
   return e;
-}
-
-int takeEncoderDelta() {
-  // 和中断共用变量: 必须关中断再取/清零, 否则并发的那次 += 会被整体抹掉
-  noInterrupts();
-  int d = sEncDelta;
-  sEncDelta = 0;
-  interrupts();
-  return d;
 }
 
 }  // namespace Controls

@@ -16,7 +16,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("secs", nargs="?", type=float, default=30.0)
     ap.add_argument("baud", nargs="?", type=int, default=115200)
-    ap.add_argument("--port", default="COM5")
+    ap.add_argument("--port", default=None, help="不填则自动找 VID:PID=303A:1001 的 ESP32-C3")
     ap.add_argument("--cmd", action="append", default=[], metavar="秒:内容")
     ap.add_argument("--no-reset", action="store_true")
     args = ap.parse_args()
@@ -28,8 +28,19 @@ def main():
     cmds.sort()
 
     import serial
+    from serial.tools import list_ports
 
-    ser = serial.Serial(args.port, args.baud, timeout=0.2)
+    port = args.port
+    if port is None:
+        # 换板子/换 USB 口 COM 号会变, 按 Espressif 的 VID:PID 找最稳
+        found = [p.device for p in list_ports.comports()
+                 if (p.vid == 0x303A and p.pid == 0x1001)
+                 or "303A:1001" in (p.hwid or "").upper()]
+        if not found:
+            sys.exit("未找到 ESP32-C3 (VID:PID=303A:1001), 用 --port COMx 手动指定")
+        port = found[0]
+
+    ser = serial.Serial(port, args.baud, timeout=0.2)
 
     if not args.no_reset:
         # 拉一把 RTS 让板子复位, 好看到完整开机日志
